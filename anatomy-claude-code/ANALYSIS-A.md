@@ -244,6 +244,243 @@ export function createRecoveredDisabledTool({ name, searchHint, unavailableMessa
 
 ## 3. 전체 아키텍처 개요
 
+### 3.0 High-Level Architecture
+
+Claude Code는 사용자의 자연어 입력을 받아 코드 편집, 파일 검색, 셸 실행 등의 작업을 자율적으로 수행하는 **에이전틱 AI 시스템**이다. 아래 다이어그램은 사용자 입력이 최종 응답으로 변환되기까지의 전체 흐름을 보여준다.
+
+```mermaid
+flowchart TB
+    subgraph USER["사용자 인터페이스"]
+        INPUT["사용자 입력<br/>(CLI / IDE / Web / Bridge)"]
+        OUTPUT["응답 출력<br/>(스트리밍 터미널 렌더링)"]
+    end
+
+    subgraph INIT["초기화 계층"]
+        ENTRY["진입점 라우팅<br/>cli.tsx / mcp.ts / sdk/"]
+        BOOT["부트스트랩<br/>OAuth, 설정, MCP 연결,<br/>피처 플래그, 텔레메트리"]
+        PROMPT_ASM["시스템 프롬프트 조립<br/>14개 섹션 동적 구성<br/>(정적 캐시 + 동적 컨텍스트)"]
+    end
+
+    subgraph CORE["핵심 엔진 (에이전틱 루프)"]
+        QE["QueryEngine<br/>세션 관리 · 영속화<br/>권한 추적 · 비용 계산"]
+        QUERY["query.ts 상태머신<br/>AsyncGenerator<br/>6단계 파이프라인"]
+        
+        subgraph PIPELINE["6단계 파이프라인 (턴당 1회)"]
+            direction LR
+            S1["① 압축<br/>4계층"]
+            S2["② API 호출<br/>스트리밍"]
+            S3["③ 에러<br/>복구"]
+            S4["④ 중단<br/>판정"]
+            S5["⑤ 도구<br/>실행"]
+            S6["⑥ 후처리<br/>전이"]
+            S1 --> S2 --> S3 --> S4 --> S5 --> S6
+        end
+    end
+
+    subgraph TOOLS["도구 실행 계층"]
+        POOL["도구 풀 조립<br/>(빌트인 + MCP 정렬)"]
+        STE["StreamingToolExecutor<br/>병렬(읽기) / 순차(쓰기)"]
+        
+        subgraph TOOL_CATS["도구 카테고리"]
+            direction LR
+            T_FILE["파일<br/>Read/Write/Edit"]
+            T_SEARCH["검색<br/>Glob/Grep"]
+            T_EXEC["실행<br/>Bash/PowerShell"]
+            T_WEB["웹<br/>Fetch/Search"]
+            T_AGENT["에이전트<br/>Agent/Team/<br/>SendMessage"]
+            T_TASK["태스크<br/>Create/Update/<br/>List/Stop"]
+            T_MCP["MCP 도구<br/>(외부 서버)"]
+        end
+    end
+
+    subgraph SECURITY["보안 계층 (8겹)"]
+        direction LR
+        SEC1["①빌드타임<br/>DCE"]
+        SEC2["②킬스위치<br/>GrowthBook"]
+        SEC3["③설정규칙<br/>8소스"]
+        SEC4["④자동분류<br/>yoloClassifier"]
+        SEC5["⑤패턴감지<br/>위험명령"]
+        SEC6["⑥경로검증<br/>62K"]
+        SEC7["⑦Trust<br/>Dialog"]
+        SEC8["⑧Bypass<br/>킬스위치"]
+    end
+
+    subgraph SERVICES["서비스 계층"]
+        API_SVC["API 클라이언트<br/>Claude/Bedrock/<br/>Vertex/Foundry"]
+        MCP_SVC["MCP 통합<br/>4개 트랜스포트"]
+        COMPACT_SVC["압축 서비스<br/>auto/reactive/snip"]
+        MEMORY_SVC["메모리 시스템<br/>CLAUDE.md · memdir<br/>세션메모리 · MagicDocs"]
+        ANALYTICS["분석/텔레메트리<br/>OTel · GrowthBook"]
+        PLUGIN_SVC["플러그인<br/>14개 공식 + 사용자"]
+    end
+
+    subgraph MULTI["멀티 에이전트 계층"]
+        COORD["Coordinator Mode<br/>감독자 패턴"]
+        TEAM["에이전트 팀<br/>TeamCreate"]
+        SUBAGENT["서브에이전트<br/>AgentTool"]
+        WORKTREE["Git Worktree<br/>격리된 작업공간"]
+        SCRATCH["공유 스크래치패드<br/>에이전트간 데이터 교환"]
+    end
+
+    INPUT --> ENTRY
+    ENTRY --> BOOT
+    BOOT --> PROMPT_ASM
+    PROMPT_ASM --> QE
+    QE --> QUERY
+    QUERY --> PIPELINE
+    S5 --> POOL --> STE --> TOOL_CATS
+    STE -.->|"권한 검증"| SECURITY
+    S2 --> API_SVC
+    S1 --> COMPACT_SVC
+    S6 --> MEMORY_SVC
+    QUERY -.->|"피처 플래그"| ANALYTICS
+    T_MCP --> MCP_SVC
+    T_AGENT --> MULTI
+    COORD --> SUBAGENT
+    TEAM --> SUBAGENT
+    SUBAGENT -->|"재귀: query() 호출"| QUERY
+    SUBAGENT --> WORKTREE
+    QUERY --> OUTPUT
+    
+    style CORE fill:#1a1a2e,color:#fff
+    style PIPELINE fill:#16213e,color:#fff
+    style SECURITY fill:#4a0e0e,color:#fff
+    style MULTI fill:#0e4a2e,color:#fff
+```
+
+#### 고수준 동작 흐름 해설
+
+**1단계: 진입과 초기화**
+
+사용자 입력은 4개의 진입점(CLI, IDE 확장, Web UI, Bridge 원격)을 통해 들어온다. 각 진입점은 공통 초기화 경로(`init.ts`)를 거쳐 OAuth 인증, 설정 로딩, MCP 서버 연결, GrowthBook 피처 플래그 동기화, OpenTelemetry 텔레메트리 초기화를 수행한다.
+
+```
+사용자 입력 → cli.tsx (CLI) ──┐
+           → mcp.ts (MCP)  ──┤→ init.ts → 공통 초기화
+           → sdk/ (Agent SDK) ┤
+           → bridge/ (원격)  ──┘
+```
+
+**2단계: 시스템 프롬프트 조립**
+
+`getSystemPrompt()` 함수가 14개 섹션을 동적으로 조립한다. 정적 섹션(역할, 규칙, 도구 설명)은 `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 마커를 기준으로 **프롬프트 캐시**에 저장되고, 동적 섹션(환경, 메모리, MCP 지침)은 매 세션마다 재구성된다. 이 분리가 API 비용 최적화의 핵심이다.
+
+```typescript
+// 시스템 프롬프트 구조 (14개 섹션)
+[
+  // ── 정적 영역 (캐시 가능) ──────────────
+  "# System",              // 역할과 정체성
+  "# Doing tasks",         // 작업 수행 규칙
+  "# Executing actions with care", // 행동 신중성
+  "# Using your tools",    // 도구 사용 가이드
+  "# Tone and style",      // 톤과 스타일
+  "# Output efficiency",   // 출력 효율성
+  
+  SYSTEM_PROMPT_DYNAMIC_BOUNDARY, // ← 캐시 경계
+  
+  // ── 동적 영역 (세션별 재구성) ──────────
+  "# Session-specific guidance", // 세션별 가이드
+  "# Environment",         // 환경 정보 (CWD, OS, Shell)
+  "# Memory",              // CLAUDE.md, memdir 메모리
+  "# MCP Server Instructions", // 연결된 MCP 서버 지침
+  "# Language/OutputStyle", // 언어/출력 스타일
+  "# Scratchpad",          // 코디네이터 스크래치패드
+  "# auto memory",         // 자동 메모리 시스템
+]
+```
+
+**3단계: 에이전틱 루프 (핵심 엔진)**
+
+QueryEngine이 `query()` AsyncGenerator를 생성하고, 턴(turn) 단위로 6단계 파이프라인을 반복 실행한다. 각 턴은 다음과 같이 연결된다:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    하나의 턴(Turn)                            │
+│                                                             │
+│  ① 압축 → ② API 호출 → ③ 에러복구 → ④ 중단판정 → ⑤ 도구실행 → ⑥ 후처리 │
+│     │          │            │            │           │          │    │
+│     │          │            │            │           │          │    │
+│     ▼          ▼            ▼            ▼           ▼          ▼    │
+│  4계층      Claude API   PTL/토큰    diminishing  병렬/순차   스킬/메모리 │
+│  캐스케이드  스트리밍      복구 3단계  returns 감지  도구 실행   MCP 갱신   │
+└────────────────────────────────────────────────────────┬────┘
+                                                         │
+                                              모델이 도구 호출 시 → 다음 턴
+                                              모델이 텍스트만 응답 → 완료
+```
+
+**4단계: 도구 실행과 보안**
+
+모델이 도구 호출을 요청하면, 8계층 보안 검증을 통과한 후 StreamingToolExecutor가 실행한다. 읽기 전용 도구(Glob, Grep, FileRead)는 **병렬** 실행되고, 상태 변경 도구(Bash, FileWrite, FileEdit)는 **순차** 실행된다. 이 분류가 응답 속도와 안정성의 균형을 만든다.
+
+```
+모델의 도구 호출 요청
+    │
+    ▼
+┌─ 보안 8계층 검증 ─────────────────────────────┐
+│ ① 빌드타임 DCE (코드 자체가 없음)               │
+│ ② GrowthBook 킬스위치 (서버 측 비활성화)         │
+│ ③ 설정 규칙 8소스 (allow/deny/ask)              │
+│ ④ yoloClassifier (자동모드 시 AI 분류)          │
+│ ⑤ 위험 패턴 감지 (python, curl, sudo 등)        │
+│ ⑥ 파일경로 검증 (심링크 탈출 방지)               │
+│ ⑦ Trust Dialog (초기 세션 확인)                  │
+│ ⑧ Bypass 킬스위치 (긴급 차단)                   │
+└───────────────────────────────────────────────┘
+    │ 통과
+    ▼
+StreamingToolExecutor
+    ├── 읽기 전용 → Promise.all() 병렬 실행
+    │   (FileRead, Glob, Grep, WebSearch, WebFetch)
+    │
+    └── 상태 변경 → for...of 순차 실행
+        (Bash, FileWrite, FileEdit)
+```
+
+**5단계: 멀티 에이전트 (재귀 구조)**
+
+AgentTool 또는 TeamCreateTool이 호출되면, 새로운 `query()` 인스턴스가 **재귀적으로** 생성된다. 각 서브에이전트는 독립된 Git Worktree에서 작업하며, Coordinator Mode의 감독자 에이전트는 코드를 직접 작성하지 않고 워커만 관리한다.
+
+```
+메인 에이전트 (query.ts)
+    │
+    ├── AgentTool("Explore") → query() 재귀 [읽기 전용]
+    │
+    ├── AgentTool("Plan") → query() 재귀 [읽기 전용]
+    │
+    ├── TeamCreateTool → 에이전트 팀 생성
+    │   ├── Worker A → query() + Git Worktree A
+    │   ├── Worker B → query() + Git Worktree B
+    │   └── Worker C → query() + Git Worktree C
+    │
+    └── Coordinator Mode
+        └── 감독자 에이전트 (AgentTool, SendMessage, TaskStop만 사용)
+            ├── SendMessage → Worker에 지시
+            ├── <task-notification> → 결과 수신
+            └── TaskStop → Worker 종료
+```
+
+**6단계: 서비스 계층과 영속화**
+
+모든 턴의 결과는 서비스 계층을 통해 영속화된다:
+- **사용자 메시지**: 블로킹 저장 (`--resume`으로 복원 가능)
+- **어시스턴트 메시지**: 비동기 fire-and-forget (재생성 가능하므로 성능 우선)
+- **메모리**: CLAUDE.md, memdir, 세션메모리에 자동 추출/저장
+- **비용**: 실시간 토큰 카운팅 및 USD 환산
+- **텔레메트리**: OpenTelemetry로 분산 추적
+
+#### 핵심 아키텍처 원칙 요약
+
+| 원칙 | 구현 | 이유 |
+|------|------|------|
+| **비용 인식** | 무료 압축 우선, API 호출은 최후 | API 호출 비용이 아키텍처 결정을 좌우 |
+| **캐시 안정성** | 빌트인/MCP 분리 정렬, 정적/동적 프롬프트 경계 | 프롬프트 캐시 히트율 극대화 |
+| **Fail-Closed** | 보안 검증 실패 시 도구 실행 차단 | 안전이 기본, 허용은 예외 |
+| **원자적 전이** | Continue Site 패턴 (상태 객체 재할당) | 중간 상태 노출 방지 |
+| **비대칭 영속화** | 사용자=블로킹, AI=비동기 | 사용자 입력 손실은 치명적, AI 응답은 재생성 가능 |
+| **재귀적 에이전트** | query() → AgentTool → query() | 동일 엔진으로 멀티에이전트 구현 |
+| **감소 수익 감지** | 3턴 연속 < 500토큰 변화 시 중단 | 무의미한 반복 방지 |
+
 ### 3.1 계층 다이어그램
 
 ```mermaid
